@@ -1,6 +1,6 @@
 # MLX-Z: Zig Bindings for Apple MLX
 
-Zig wrappers for [Apple's MLX C API](https://github.com/ml-explore/mlx) (`mlx-c`), providing type-safe, idiomatic Zig access to the Metal GPU-accelerated array framework.
+Zig wrappers for [Apple's MLX C API](https://github.com/ml-explore/mlx-c) (`mlx-c`), providing type-safe, idiomatic Zig access to the Metal GPU-accelerated array framework.
 
 ## Features
 
