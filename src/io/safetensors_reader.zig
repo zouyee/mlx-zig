@@ -1036,8 +1036,9 @@ pub const PartialTensorReader = struct {
     /// Read multiple expert rows and assemble into a mini-fused tensor.
     /// Returns an Array with shape [n_experts, D1, D2, ...].
     ///
-    /// When mmap_pool is available, copies each expert's row from the mapped region
-    /// into a contiguous buffer (no syscalls). Otherwise falls back to pread.
+    /// When mmap_pool is available, creates zero-copy Arrays for each expert row
+    /// directly from the mapped region, then concatenates on GPU (no CPU memcpy).
+    /// Otherwise falls back to pread + CPU buffer assembly.
     pub fn readExpertRows(
         self: *PartialTensorReader,
         tensor_name: []const u8,
@@ -1054,37 +1055,96 @@ pub const PartialTensorReader = struct {
             if (eid >= n_experts) return error.ExpertIdOutOfRange;
         }
 
-        // Compute row_bytes from the first expert (all rows are the same size)
-        const first_range = self.computeExpertByteRange(&info, expert_ids[0]);
-        const row_bytes = first_range.length;
+        // Map dtype string to MLX dtype
+        const mlx_dtype = dtypeFromString(info.dtype_str) orelse return error.UnsupportedDtype;
 
-        // Allocate a single contiguous buffer for all expert rows
+        // Build per-row shape as [1, D1, D2, ...]
+        var row_shape_i32 = try self.allocator.alloc(i32, info.shape.len);
+        defer self.allocator.free(row_shape_i32);
+        row_shape_i32[0] = 1; // single expert
+        for (info.shape[1..], 1..) |dim, idx| {
+            row_shape_i32[idx] = @intCast(dim);
+        }
+
+        if (self.mmap_pool) |pool| {
+            // Zero-copy mmap path: create per-expert Arrays directly from mmap,
+            // then concatenate on GPU. No CPU memcpy needed.
+            //
+            // This is the key optimization: Apple Silicon unified memory allows
+            // the GPU to directly access mmap'd pages. The OS handles page faults
+            // transparently, loading data from SSD only when accessed by GPU.
+            // This matches Python mlx-lm's mx.load() behavior.
+            if (expert_ids.len == 1) {
+                // Single expert: direct zero-copy return (no concatenation needed)
+                const range = self.computeExpertByteRange(&info, expert_ids[0]);
+                const slice = try pool.getSlice(info.shard_path, range.offset, range.length);
+                const arr = c.c.mlx_array_new_data_managed_payload(
+                    @constCast(slice.ptr),
+                    row_shape_i32.ptr,
+                    @intCast(row_shape_i32.len),
+                    mlx_dtype,
+                    null,
+                    noopDeleter,
+                );
+                return Array.fromHandle(arr);
+            }
+
+            // Multiple experts: create zero-copy Array per expert, concatenate on GPU
+            var expert_arrays = try self.allocator.alloc(c.c.mlx_array, expert_ids.len);
+            defer self.allocator.free(expert_arrays);
+
+            for (expert_ids, 0..) |eid, i| {
+                const range = self.computeExpertByteRange(&info, eid);
+                const slice = try pool.getSlice(info.shard_path, range.offset, range.length);
+                expert_arrays[i] = c.c.mlx_array_new_data_managed_payload(
+                    @constCast(slice.ptr),
+                    row_shape_i32.ptr,
+                    @intCast(row_shape_i32.len),
+                    mlx_dtype,
+                    null,
+                    noopDeleter,
+                );
+            }
+            defer for (expert_arrays) |arr| c.c.mlx_array_free(arr);
+
+            // Concatenate along axis 0 on GPU (zero CPU memcpy)
+            const vec = c.c.mlx_vector_array_new();
+            defer c.c.mlx_vector_array_free(vec);
+            try c.check(c.c.mlx_vector_array_append_data(vec, expert_arrays.ptr, expert_arrays.len));
+
+            var result = c.c.mlx_array_new();
+            const stream = c.c.mlx_default_gpu_stream_new();
+            defer c.c.mlx_stream_free(stream);
+            try c.check(c.c.mlx_concatenate_axis(&result, vec, 0, stream));
+            return Array.fromHandle(result);
+        }
+
+        // pread fallback path (no mmap available)
+        return self.readExpertRowsCpu(tensor_name, expert_ids, &info, mlx_dtype);
+    }
+
+    /// CPU fallback: read expert rows via pread into a contiguous buffer.
+    fn readExpertRowsCpu(
+        self: *PartialTensorReader,
+        tensor_name: []const u8,
+        expert_ids: []const u32,
+        info: *const TensorInfo,
+        mlx_dtype: u32,
+    ) !Array {
+        _ = tensor_name;
+        const first_range = self.computeExpertByteRange(info, expert_ids[0]);
+        const row_bytes = first_range.length;
         const total_bytes = expert_ids.len * row_bytes;
         const buf = try self.allocator.alloc(u8, total_bytes);
         defer self.allocator.free(buf);
 
-        if (self.mmap_pool) |pool| {
-            // mmap path: memcpy each expert's row from the mapped region
-            for (expert_ids, 0..) |eid, i| {
-                const range = self.computeExpertByteRange(&info, eid);
-                const slice = try pool.getSlice(info.shard_path, range.offset, range.length);
-                const dest = buf[i * row_bytes .. (i + 1) * row_bytes];
-                @memcpy(dest, slice);
-            }
-        } else {
-            // pread fallback path
-            const fd = try self.fd_pool.getFd(info.shard_path);
-
-            for (expert_ids, 0..) |eid, i| {
-                const range = self.computeExpertByteRange(&info, eid);
-                const dest = buf.ptr + i * row_bytes;
-                const bytes_read = unistd.pread(fd, dest, range.length, @intCast(range.offset));
-                if (bytes_read < @as(isize, @intCast(range.length))) return error.IncompleteRead;
-            }
+        const fd = try self.fd_pool.getFd(info.shard_path);
+        for (expert_ids, 0..) |eid, i| {
+            const range = self.computeExpertByteRange(info, eid);
+            const dest = buf.ptr + i * row_bytes;
+            const bytes_read = unistd.pread(fd, dest, range.length, @intCast(range.offset));
+            if (bytes_read < @as(isize, @intCast(range.length))) return error.IncompleteRead;
         }
-
-        // Map dtype string to MLX dtype
-        const mlx_dtype = dtypeFromString(info.dtype_str) orelse return error.UnsupportedDtype;
 
         // Build shape as [n_selected, D1, D2, ...]
         var shape_i32 = try self.allocator.alloc(i32, info.shape.len);
@@ -1094,7 +1154,6 @@ pub const PartialTensorReader = struct {
             shape_i32[idx] = @intCast(dim);
         }
 
-        // Create MLX array from the contiguous buffer (mlx_array_new_data copies the data)
         const arr = c.c.mlx_array_new_data(
             buf.ptr,
             shape_i32.ptr,
