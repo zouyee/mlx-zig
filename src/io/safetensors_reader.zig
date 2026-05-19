@@ -747,6 +747,12 @@ pub const FdPool = struct {
             const fd = posix.open(path_z.ptr, posix.O_RDONLY);
             if (fd < 0) return error.FileNotFound;
 
+            // Enable kernel readahead on macOS (F_RDAHEAD).
+            // This tells the kernel to aggressively prefetch sequential data,
+            // compensating for the lack of mmap readahead in pread-only mode.
+            const fcntl_c = @cImport(@cInclude("fcntl.h"));
+            _ = fcntl_c.fcntl(fd, fcntl_c.F_RDAHEAD, @as(c_int, 1));
+
             // Store a duplicated path string as the key so we can free it on deinit
             const key = try self.allocator.dupe(u8, shard_path);
             errdefer self.allocator.free(key);
@@ -1067,6 +1073,20 @@ pub const PartialTensorReader = struct {
         }
 
         if (self.mmap_pool) |pool| {
+            // P2: Prefetch expert data with madvise WILLNEED before accessing
+            // This tells the OS to start loading pages asynchronously, reducing
+            // latency when the GPU actually accesses the data.
+            const posix_c = @cImport(@cInclude("sys/mman.h"));
+            for (expert_ids) |eid| {
+                const range = self.computeExpertByteRange(&info, eid);
+                const slice = pool.getSlice(info.shard_path, range.offset, range.length) catch continue;
+                _ = posix_c.posix_madvise(
+                    @ptrCast(@constCast(slice.ptr)),
+                    slice.len,
+                    posix_c.POSIX_MADV_WILLNEED,
+                );
+            }
+
             // Zero-copy mmap path: create per-expert Arrays directly from mmap,
             // then concatenate on GPU. No CPU memcpy needed.
             //
@@ -1105,16 +1125,18 @@ pub const PartialTensorReader = struct {
                     noopDeleter,
                 );
             }
-            defer for (expert_arrays) |arr| c.c.mlx_array_free(arr);
+            defer for (expert_arrays) |arr| {
+                _ = c.c.mlx_array_free(arr);
+            };
 
             // Concatenate along axis 0 on GPU (zero CPU memcpy)
             const vec = c.c.mlx_vector_array_new();
-            defer c.c.mlx_vector_array_free(vec);
+            defer _ = c.c.mlx_vector_array_free(vec);
             try c.check(c.c.mlx_vector_array_append_data(vec, expert_arrays.ptr, expert_arrays.len));
 
             var result = c.c.mlx_array_new();
             const stream = c.c.mlx_default_gpu_stream_new();
-            defer c.c.mlx_stream_free(stream);
+            defer _ = c.c.mlx_stream_free(stream);
             try c.check(c.c.mlx_concatenate_axis(&result, vec, 0, stream));
             return Array.fromHandle(result);
         }
@@ -1124,6 +1146,8 @@ pub const PartialTensorReader = struct {
     }
 
     /// CPU fallback: read expert rows via pread into a contiguous buffer.
+    /// Optimization: coalesces consecutive expert IDs into single pread calls
+    /// to reduce syscall overhead. Expert IDs must be sorted (caller guarantees this).
     fn readExpertRowsCpu(
         self: *PartialTensorReader,
         tensor_name: []const u8,
@@ -1139,11 +1163,28 @@ pub const PartialTensorReader = struct {
         defer self.allocator.free(buf);
 
         const fd = try self.fd_pool.getFd(info.shard_path);
-        for (expert_ids, 0..) |eid, i| {
-            const range = self.computeExpertByteRange(info, eid);
+
+        // Coalesced pread: merge consecutive expert IDs into single reads.
+        // Since expert_ids are sorted, consecutive IDs (e.g., [3,4,5]) are
+        // adjacent in the file and can be read with one pread call.
+        var i: usize = 0;
+        while (i < expert_ids.len) {
+            // Find the run of consecutive expert IDs starting at i
+            var run_len: usize = 1;
+            while (i + run_len < expert_ids.len and
+                expert_ids[i + run_len] == expert_ids[i] + @as(u32, @intCast(run_len)))
+            {
+                run_len += 1;
+            }
+
+            // Read the entire consecutive run in one pread
+            const range = self.computeExpertByteRange(info, expert_ids[i]);
+            const read_len = run_len * row_bytes;
             const dest = buf.ptr + i * row_bytes;
-            const bytes_read = unistd.pread(fd, dest, range.length, @intCast(range.offset));
-            if (bytes_read < @as(isize, @intCast(range.length))) return error.IncompleteRead;
+            const bytes_read = unistd.pread(fd, dest, read_len, @intCast(range.offset));
+            if (bytes_read < @as(isize, @intCast(read_len))) return error.IncompleteRead;
+
+            i += run_len;
         }
 
         // Build shape as [n_selected, D1, D2, ...]
