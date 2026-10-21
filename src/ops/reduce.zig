@@ -174,13 +174,15 @@ pub fn varAxes(_ctx: EagerContext, a: Array, axes: []const i32, keepdims: bool, 
 
 pub fn cumsum(_ctx: EagerContext, a: Array, axis: i32, reverse: bool, inclusive: bool) !Array {
     var res = c.c.mlx_array_new();
-    try c.check(c.c.mlx_cumsum(&res, a.inner, axis, reverse, inclusive, _ctx.stream.inner));
+    const no_dtype: c.c.mlx_optional_dtype = .{ .has_value = false, .value = c.c.MLX_FLOAT32 };
+    try c.check(c.c.mlx_cumsum_axis(&res, a.inner, axis, reverse, inclusive, no_dtype, _ctx.stream.inner));
     return Array.fromHandle(res);
 }
 
 pub fn cumprod(_ctx: EagerContext, a: Array, axis: i32, reverse: bool, inclusive: bool) !Array {
     var res = c.c.mlx_array_new();
-    try c.check(c.c.mlx_cumprod(&res, a.inner, axis, reverse, inclusive, _ctx.stream.inner));
+    const no_dtype: c.c.mlx_optional_dtype = .{ .has_value = false, .value = c.c.MLX_FLOAT32 };
+    try c.check(c.c.mlx_cumprod_axis(&res, a.inner, axis, reverse, inclusive, no_dtype, _ctx.stream.inner));
     return Array.fromHandle(res);
 }
 

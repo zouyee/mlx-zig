@@ -12,8 +12,10 @@
 ///     allocator,
 ///     "my_kernel",
 ///     &.{"input"},
+///     &.{"output"},
 ///     "kernel void my_kernel(device float* input [[buffer(0)]], ...) { ... }",
 ///     "",
+///     true,
 ///     false,
 /// );
 /// defer kernel.deinit();
@@ -118,15 +120,19 @@ pub const CustomMetalKernel = struct {
     ///   - allocator: Memory allocator for temporary strings
     ///   - name: Kernel function name (must match the Metal function name)
     ///   - input_names: Names of input arguments (bound to Metal buffers in order)
+    ///   - output_names: Names of output arguments (must match addOutputArg order)
     ///   - source: Metal shader source code string
     ///   - header: Optional Metal header source (e.g., shared structs/functions)
+    ///   - ensure_row_contiguous: Force row-contiguous input/output layouts
     ///   - atomic_outputs: Whether outputs use atomic operations
     pub fn init(
         allocator: std.mem.Allocator,
         name: []const u8,
         input_names: []const []const u8,
+        output_names: []const []const u8,
         source: []const u8,
         header: []const u8,
+        ensure_row_contiguous: bool,
         atomic_outputs: bool,
     ) !CustomMetalKernel {
         const name_z = try allocator.dupeZ(u8, name);
@@ -136,21 +142,30 @@ pub const CustomMetalKernel = struct {
         const header_z = try allocator.dupeZ(u8, header);
         defer allocator.free(header_z);
 
-        // Build mlx_vector_string for input names
-        const vec = c.c.mlx_vector_string_new();
-        defer _ = c.c.mlx_vector_string_free(vec);
+        const in_vec = c.c.mlx_vector_string_new();
+        defer _ = c.c.mlx_vector_string_free(in_vec);
         for (input_names) |iname| {
             const iname_z = try allocator.dupeZ(u8, iname);
             defer allocator.free(iname_z);
-            try c.check(c.c.mlx_vector_string_add_value(vec, iname_z.ptr));
+            try c.check(c.c.mlx_vector_string_append_value(in_vec, iname_z.ptr));
+        }
+
+        const out_vec = c.c.mlx_vector_string_new();
+        defer _ = c.c.mlx_vector_string_free(out_vec);
+        for (output_names) |oname| {
+            const oname_z = try allocator.dupeZ(u8, oname);
+            defer allocator.free(oname_z);
+            try c.check(c.c.mlx_vector_string_append_value(out_vec, oname_z.ptr));
         }
 
         return .{
             .inner = c.c.mlx_fast_metal_kernel_new(
                 name_z.ptr,
-                vec,
+                in_vec,
+                out_vec,
                 source_z.ptr,
                 header_z.ptr,
+                ensure_row_contiguous,
                 atomic_outputs,
             ),
         };
@@ -173,7 +188,7 @@ pub const CustomMetalKernel = struct {
         const input_vec = c.c.mlx_vector_array_new();
         defer _ = c.c.mlx_vector_array_free(input_vec);
         for (inputs) |inp| {
-            try c.check(c.c.mlx_vector_array_add_value(input_vec, inp.inner));
+            try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
         }
 
         var output_vec = c.c.mlx_vector_array_new();

@@ -194,6 +194,9 @@ pub fn dtypeFromString(s: []const u8) ?c.c.mlx_dtype {
     if (std.mem.eql(u8, s, "U32")) return c.c.MLX_UINT32;
     if (std.mem.eql(u8, s, "U64")) return c.c.MLX_UINT64;
     if (std.mem.eql(u8, s, "BOOL")) return c.c.MLX_BOOL;
+    // FP8 dtypes: load as uint8 and dequantize later via mlx_from_fp8
+    if (std.mem.eql(u8, s, "F8_E4M3")) return c.c.MLX_UINT8;
+    if (std.mem.eql(u8, s, "F8_E8M0")) return c.c.MLX_UINT8;
     return null;
 }
 
@@ -935,6 +938,8 @@ pub const PartialTensorReader = struct {
         if (std.mem.eql(u8, dtype_str, "I64")) return 8;
         if (std.mem.eql(u8, dtype_str, "U64")) return 8;
         if (std.mem.eql(u8, dtype_str, "BOOL")) return 1;
+        if (std.mem.eql(u8, dtype_str, "F8_E4M3")) return 1;
+        if (std.mem.eql(u8, dtype_str, "F8_E8M0")) return 1;
         return null;
     }
 
@@ -1148,6 +1153,11 @@ pub const PartialTensorReader = struct {
     /// CPU fallback: read expert rows via pread into a contiguous buffer.
     /// Optimization: coalesces consecutive expert IDs into single pread calls
     /// to reduce syscall overhead. Expert IDs must be sorted (caller guarantees this).
+    ///
+    /// Flash-MoE insight: parallel pread gives 9.2x speedup over sequential pread
+    /// by utilizing Apple NVMe's command queue depth. We spawn one thread per
+    /// non-consecutive run of expert IDs, letting the SSD handle multiple I/O
+    /// requests simultaneously.
     fn readExpertRowsCpu(
         self: *PartialTensorReader,
         tensor_name: []const u8,
@@ -1164,27 +1174,77 @@ pub const PartialTensorReader = struct {
 
         const fd = try self.fd_pool.getFd(info.shard_path);
 
-        // Coalesced pread: merge consecutive expert IDs into single reads.
-        // Since expert_ids are sorted, consecutive IDs (e.g., [3,4,5]) are
-        // adjacent in the file and can be read with one pread call.
+        // Build list of coalesced runs (consecutive expert IDs → single pread)
+        const Run = struct {
+            start_idx: usize, // index into expert_ids
+            run_len: usize,   // number of consecutive experts
+        };
+        var runs = std.ArrayList(Run).empty;
+        defer runs.deinit(self.allocator);
+
         var i: usize = 0;
         while (i < expert_ids.len) {
-            // Find the run of consecutive expert IDs starting at i
             var run_len: usize = 1;
             while (i + run_len < expert_ids.len and
                 expert_ids[i + run_len] == expert_ids[i] + @as(u32, @intCast(run_len)))
             {
                 run_len += 1;
             }
+            try runs.append(self.allocator, Run{ .start_idx = i, .run_len = run_len });
+            i += run_len;
+        }
 
-            // Read the entire consecutive run in one pread
-            const range = self.computeExpertByteRange(info, expert_ids[i]);
-            const read_len = run_len * row_bytes;
-            const dest = buf.ptr + i * row_bytes;
+        // Parallel pread: spawn one thread per run (Flash-MoE technique)
+        // pread() is thread-safe (no shared file offset state).
+        // For small numbers of runs (typically 1-6), thread overhead is minimal.
+        const PreadArgs = struct {
+            fd: c_int,
+            dest: [*]u8,
+            len: usize,
+            offset: i64,
+            err: ?anyerror = null,
+        };
+
+        const preadWorker = struct {
+            fn run(args: *PreadArgs) void {
+                const bytes_read = unistd.pread(args.fd, args.dest, args.len, args.offset);
+                if (bytes_read < @as(isize, @intCast(args.len))) {
+                    args.err = error.IncompleteRead;
+                }
+            }
+        }.run;
+
+        if (runs.items.len <= 1) {
+            // Single run: no threading overhead, just do it directly
+            const run = runs.items[0];
+            const range = self.computeExpertByteRange(info, expert_ids[run.start_idx]);
+            const read_len = run.run_len * row_bytes;
+            const dest = buf.ptr + run.start_idx * row_bytes;
             const bytes_read = unistd.pread(fd, dest, read_len, @intCast(range.offset));
             if (bytes_read < @as(isize, @intCast(read_len))) return error.IncompleteRead;
+        } else {
+            // Multiple non-consecutive runs: parallel pread
+            var args_list = try self.allocator.alloc(PreadArgs, runs.items.len);
+            defer self.allocator.free(args_list);
+            var threads = try self.allocator.alloc(std.Thread, runs.items.len);
+            defer self.allocator.free(threads);
 
-            i += run_len;
+            for (runs.items, 0..) |run, t| {
+                const range = self.computeExpertByteRange(info, expert_ids[run.start_idx]);
+                args_list[t] = PreadArgs{
+                    .fd = fd,
+                    .dest = buf.ptr + run.start_idx * row_bytes,
+                    .len = run.run_len * row_bytes,
+                    .offset = @intCast(range.offset),
+                };
+                threads[t] = try std.Thread.spawn(.{}, preadWorker, .{&args_list[t]});
+            }
+
+            // Wait for all threads and check errors
+            for (threads) |t| t.join();
+            for (args_list) |arg| {
+                if (arg.err) |err| return err;
+            }
         }
 
         // Build shape as [n_selected, D1, D2, ...]

@@ -43,6 +43,6 @@ pub fn scaledDotProductAttention(_ctx: EagerContext, queries: Array, keys: Array
     // correctly translates to std::nullopt in the C++ layer.
     const m_ptr = if (mask_arr) |m| m.inner else c.c.mlx_array_empty;
     const s_ptr = if (sinks) |s| s.inner else c.c.mlx_array_empty;
-    try c.check(c.c.mlx_fast_scaled_dot_product_attention(&res, queries.inner, keys.inner, values.inner, scale, mask_mode.ptr, m_ptr, s_ptr, _ctx.stream.inner));
+    try c.check(c.c.mlx_fast_scaled_dot_product_attention(&res, queries.inner, keys.inner, values.inner, scale, mask_mode.ptr, m_ptr, s_ptr, false, _ctx.stream.inner));
     return Array.fromHandle(res);
 }
